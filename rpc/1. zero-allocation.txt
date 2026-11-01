@@ -1,0 +1,292 @@
+Чтобы свести аллокации памяти в SerializingExecutor к абсолютному минимуму (в идеале — к Zero-Allocation в steady-state режиме), необходимо устранить два главных источника мусора (GC garbage):
+1. Аллокация лямбд и объектов Runnable при каждом вызове .execute(() -> { ... }).
+2. Аллокация узлов (Nodes) внутри очереди ConcurrentLinkedQueue при каждом добавлении задачи.
+Для реалтайм-систем, работающих с маркет-датой через Caplin Liberator, это критически важно, так как частые минорные сборки мусора (GC pauses) приводят к микро-рывкам задержки (latency spikes).
+Ниже приведены 3 паттерна оптимизации, которые используют высоконагруженные RPC-фреймворки (Netty, gRPC, JCTools).
+
+Паттерн 1. Избавление от очереди узлов (MPSC Array Queue)
+
+Классическая ConcurrentLinkedQueue на каждый вызов add() создает внутренний объект Node. Если у вас миллионы сообщений, это создает гигантскую нагрузку на GC.
+Решение: Если вы можете ограничить максимальный размер очереди для одного канала (например, 1024 или 4096 задач), замените её на MpscArrayQueue из библиотеки JCTools (которую под капотом использует Netty) или напишите простую кольцевую структуру на массиве.
+• MpscArrayQueue (Multiple Producer Single Consumer) идеально подходит: Caplin-потоки (их много) пишут в очередь, а один поток пула (Single Consumer) выгребает.
+• Она построена на базе фиксированного массива и использует CAS для указателей. Аллокация памяти при добавлении задачи равна нулю.
+
+Паттерн 2. Объединение Executor, Задачи и Узла в один объект (Zero-Allocation Executor)
+
+Вместо того чтобы создавать лямбду на каждый чих, мы можем сделать так, чтобы само сообщение (или контекст обработки пакета) реализовывало интерфейс Runnable.
+Но можно пойти еще дальше, как это сделано в некоторых внутренних компонентах gRPC и Netty: сам SerializingExecutor может переиспользовать постоянные (pooled) объекты задач.
+Давайте перепишем наш SerializingExecutor так, чтобы он принимал специальный тип задач, который уже содержит в себе ссылку на данные и логику, и полностью избавимся от лямбд на горячем пути (hot path).
+
+Оптимизированная реализация:
+
+java
+import java.util.Queue;
+import java.util.concurrent.Executor;
+import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
+import org.jctools.queues.MpscArrayQueue; // Рекомендуется, zero-allocation lock-free queue
+
+public final class AllocationFreeSerializingExecutor implements Executor, Runnable {
+    
+    private final Executor underlyingExecutor;
+    
+    // Используем фиксированную MPSC очередь на массиве из JCTools. 
+    // При добавлении элементов аллокаций НЕТ.
+    private final Queue<Runnable> queue;
+    
+    private volatile int runState = 0;
+    private static final AtomicIntegerFieldUpdater<AllocationFreeSerializingExecutor> STATE_UPDATER =
+            AtomicIntegerFieldUpdater.newUpdater(AllocationFreeSerializingExecutor.class, "runState");
+
+    public AllocationFreeSerializingExecutor(Executor underlyingExecutor, int maxQueueCapacity) {
+        this.underlyingExecutor = underlyingExecutor;
+        // Задаем фиксированный размер буфера (capacity должна быть степенью двойки, например 2048)
+        this.queue = new MpscArrayQueue<>(maxQueueCapacity);
+    }
+
+    @Override
+    public void execute(Runnable task) {
+        // ВАЖНО: Передаваемый task НЕ должен быть лямбдой. 
+        // Это должен быть переиспользуемый объект (см. Паттерн 3 ниже).
+        if (!queue.offer(task)) {
+            // Очередь забита (Backpressure). Защищаем память от переполнения.
+            handleQueueOverflow(task);
+            return;
+        }
+
+        if (STATE_UPDATER.compareAndSet(this, 0, 1)) {
+            try {
+                // Передаем себя (this) - нет аллокации новой задачи для пула
+                underlyingExecutor.execute(this);
+            } catch (Throwable t) {
+                STATE_UPDATER.set(this, 0);
+                throw t;
+            }
+        }
+    }
+
+    @Override
+    public void run() {
+        try {
+            Runnable task;
+            // poll() из MpscArrayQueue также не аллоцирует память
+            while ((task = queue.poll()) != null) {
+                try {
+                    task.run(); 
+                } catch (Throwable t) {
+                    // Логирование ошибок
+                }
+            }
+        } finally {
+            STATE_UPDATER.set(this, 0);
+            if (!queue.isEmpty() && STATE_UPDATER.compareAndSet(this, 0, 1)) {
+                try {
+                    underlyingExecutor.execute(this);
+                } catch (Throwable t) {
+                    STATE_UPDATER.set(this, 0);
+                }
+            }
+        }
+    }
+
+    private void handleQueueOverflow(Runnable task) {
+        // Логика обработки перегрузки (например, логирование или отправка ошибки клиенту)
+    }
+}
+Используйте код с осторожностью.
+
+Паттерн 3. Пул объектов задач (Object Pooling / Flyweight)
+
+Если вы пишете: executor.execute(() -> process(message));, то Java под капотом каждый раз делает new для объекта лямбды. Чтобы этого избежать, сообщения от Caplin или сами задачи нужно превратить в Flyweight-объекты, живущие в пуле (ThreadLocalPool или Netty Recycler).
+
+Как это применить к вашему DataSource:
+
+Вместо создания Runnable-лямбд, создайте пул готовых объектов RpcTask:
+java
+public final class RpcTask implements Runnable {
+    // Выделяем один раз при старте приложения пул таких объектов
+    private final Handle<RpcTask> handle; 
+    
+    // Меняющееся состояние (мутабельные поля)
+    private GenericMessage message;
+    private String channelId;
+    private CaplinRpcHandler handler;
+
+    public RpcTask(Handle<RpcTask> handle) {
+        this.handle = handle;
+    }
+
+    // Метод инициализации перед отправкой в Executor (вместо конструктора)
+    public void init(GenericMessage message, String channelId, CaplinRpcHandler handler) {
+        this.message = message;
+        this.channelId = channelId;
+        this.handler = handler;
+    }
+
+    @Override
+    public void run() {
+        try {
+            // Выполняем логику без аллокации контекста
+            handler.processInsideChannel(channelId, message);
+        } finally {
+            // Очищаем ссылки, чтобы не держать память
+            this.message = null;
+            this.channelId = null;
+            this.handler = null;
+            // Возвращаем объект в пул для переиспользования следующими запросами
+            handle.recycle(this); 
+        }
+    }
+}
+Используйте код с осторожностью.
+
+Резюме для Zero-Allocation на горячем пути:
+
+1. Замените ConcurrentLinkedQueue на MpscArrayQueue (убирает аллокацию Node).
+2. Замените отправку лямбд (() -> {}) на отправку статических переиспользуемых инстансов Runnable, которые вы берете из пула (например, используя io.netty.util.Recycler) и возвращаете обратно в run().
+Используется ли уже в вашем стеке библиотека Netty (из неё можно взять готовый Recycler для пулинга объектов) или вы предпочитаете минимизировать внешние зависимости и написать простой пул объектов на базе ThreadLocal вручную?
+Чтобы свести аллокации памяти в SerializingExecutor к абсолютному минимуму (в идеале — к Zero-Allocation в steady-state режиме), необходимо устранить два главных источника мусора (GC garbage):
+1. Аллокация лямбд и объектов Runnable при каждом вызове .execute(() -> { ... }).
+2. Аллокация узлов (Nodes) внутри очереди ConcurrentLinkedQueue при каждом добавлении задачи.
+Для реалтайм-систем, работающих с маркет-датой через Caplin Liberator, это критически важно, так как частые минорные сборки мусора (GC pauses) приводят к микро-рывкам задержки (latency spikes).
+Ниже приведены 3 паттерна оптимизации, которые используют высоконагруженные RPC-фреймворки (Netty, gRPC, JCTools).
+
+Паттерн 1. Избавление от очереди узлов (MPSC Array Queue)
+
+Классическая ConcurrentLinkedQueue на каждый вызов add() создает внутренний объект Node. Если у вас миллионы сообщений, это создает гигантскую нагрузку на GC.
+Решение: Если вы можете ограничить максимальный размер очереди для одного канала (например, 1024 или 4096 задач), замените её на MpscArrayQueue из библиотеки JCTools (которую под капотом использует Netty) или напишите простую кольцевую структуру на массиве.
+• MpscArrayQueue (Multiple Producer Single Consumer) идеально подходит: Caplin-потоки (их много) пишут в очередь, а один поток пула (Single Consumer) выгребает.
+• Она построена на базе фиксированного массива и использует CAS для указателей. Аллокация памяти при добавлении задачи равна нулю.
+
+Паттерн 2. Объединение Executor, Задачи и Узла в один объект (Zero-Allocation Executor)
+
+Вместо того чтобы создавать лямбду на каждый чих, мы можем сделать так, чтобы само сообщение (или контекст обработки пакета) реализовывало интерфейс Runnable.
+Но можно пойти еще дальше, как это сделано в некоторых внутренних компонентах gRPC и Netty: сам SerializingExecutor может переиспользовать постоянные (pooled) объекты задач.
+Давайте перепишем наш SerializingExecutor так, чтобы он принимал специальный тип задач, который уже содержит в себе ссылку на данные и логику, и полностью избавимся от лямбд на горячем пути (hot path).
+
+Оптимизированная реализация:
+
+java
+import java.util.Queue;
+import java.util.concurrent.Executor;
+import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
+import org.jctools.queues.MpscArrayQueue; // Рекомендуется, zero-allocation lock-free queue
+
+public final class AllocationFreeSerializingExecutor implements Executor, Runnable {
+    
+    private final Executor underlyingExecutor;
+    
+    // Используем фиксированную MPSC очередь на массиве из JCTools. 
+    // При добавлении элементов аллокаций НЕТ.
+    private final Queue<Runnable> queue;
+    
+    private volatile int runState = 0;
+    private static final AtomicIntegerFieldUpdater<AllocationFreeSerializingExecutor> STATE_UPDATER =
+            AtomicIntegerFieldUpdater.newUpdater(AllocationFreeSerializingExecutor.class, "runState");
+
+    public AllocationFreeSerializingExecutor(Executor underlyingExecutor, int maxQueueCapacity) {
+        this.underlyingExecutor = underlyingExecutor;
+        // Задаем фиксированный размер буфера (capacity должна быть степенью двойки, например 2048)
+        this.queue = new MpscArrayQueue<>(maxQueueCapacity);
+    }
+
+    @Override
+    public void execute(Runnable task) {
+        // ВАЖНО: Передаваемый task НЕ должен быть лямбдой. 
+        // Это должен быть переиспользуемый объект (см. Паттерн 3 ниже).
+        if (!queue.offer(task)) {
+            // Очередь забита (Backpressure). Защищаем память от переполнения.
+            handleQueueOverflow(task);
+            return;
+        }
+
+        if (STATE_UPDATER.compareAndSet(this, 0, 1)) {
+            try {
+                // Передаем себя (this) - нет аллокации новой задачи для пула
+                underlyingExecutor.execute(this);
+            } catch (Throwable t) {
+                STATE_UPDATER.set(this, 0);
+                throw t;
+            }
+        }
+    }
+
+    @Override
+    public void run() {
+        try {
+            Runnable task;
+            // poll() из MpscArrayQueue также не аллоцирует память
+            while ((task = queue.poll()) != null) {
+                try {
+                    task.run(); 
+                } catch (Throwable t) {
+                    // Логирование ошибок
+                }
+            }
+        } finally {
+            STATE_UPDATER.set(this, 0);
+            if (!queue.isEmpty() && STATE_UPDATER.compareAndSet(this, 0, 1)) {
+                try {
+                    underlyingExecutor.execute(this);
+                } catch (Throwable t) {
+                    STATE_UPDATER.set(this, 0);
+                }
+            }
+        }
+    }
+
+    private void handleQueueOverflow(Runnable task) {
+        // Логика обработки перегрузки (например, логирование или отправка ошибки клиенту)
+    }
+}
+Используйте код с осторожностью.
+
+Паттерн 3. Пул объектов задач (Object Pooling / Flyweight)
+
+Если вы пишете: executor.execute(() -> process(message));, то Java под капотом каждый раз делает new для объекта лямбды. Чтобы этого избежать, сообщения от Caplin или сами задачи нужно превратить в Flyweight-объекты, живущие в пуле (ThreadLocalPool или Netty Recycler).
+
+Как это применить к вашему DataSource:
+
+Вместо создания Runnable-лямбд, создайте пул готовых объектов RpcTask:
+java
+public final class RpcTask implements Runnable {
+    // Выделяем один раз при старте приложения пул таких объектов
+    private final Handle<RpcTask> handle; 
+    
+    // Меняющееся состояние (мутабельные поля)
+    private GenericMessage message;
+    private String channelId;
+    private CaplinRpcHandler handler;
+
+    public RpcTask(Handle<RpcTask> handle) {
+        this.handle = handle;
+    }
+
+    // Метод инициализации перед отправкой в Executor (вместо конструктора)
+    public void init(GenericMessage message, String channelId, CaplinRpcHandler handler) {
+        this.message = message;
+        this.channelId = channelId;
+        this.handler = handler;
+    }
+
+    @Override
+    public void run() {
+        try {
+            // Выполняем логику без аллокации контекста
+            handler.processInsideChannel(channelId, message);
+        } finally {
+            // Очищаем ссылки, чтобы не держать память
+            this.message = null;
+            this.channelId = null;
+            this.handler = null;
+            // Возвращаем объект в пул для переиспользования следующими запросами
+            handle.recycle(this); 
+        }
+    }
+}
+Используйте код с осторожностью.
+
+Резюме для Zero-Allocation на горячем пути:
+
+1. Замените ConcurrentLinkedQueue на MpscArrayQueue (убирает аллокацию Node).
+2. Замените отправку лямбд (() -> {}) на отправку статических переиспользуемых инстансов Runnable, которые вы берете из пула (например, используя io.netty.util.Recycler) и возвращаете обратно в run().
+Используется ли уже в вашем стеке библиотека Netty (из неё можно взять готовый Recycler для пулинга объектов) или вы предпочитаете минимизировать внешние зависимости и написать простой пул объектов на базе ThreadLocal вручную?

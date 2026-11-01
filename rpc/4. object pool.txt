@@ -1,0 +1,123 @@
+Когда входящие запросы прилетают из одного потока (транспортного потока DataSource API), а генерация ответов (событий, котировок, результатов вычислений) происходит в множестве независимых бизнес-потоков сервера, классический ThreadLocal для пула объектов работать не будет. Потокам-отправителям придется постоянно брать объекты из пула и возвращать их обратно, что при наивной реализации (через synchronized или ReentrantLock) создаст огромную точку конкуренции (contention) и сведет на нет всю многопоточность.
+Для обеспечения максимальной скорости работы пула RpcTask в высококонкурентной среде (много производителей — один или несколько потребителей) используют три основных паттерна.
+
+Паттерн 1. Netty Recycler (Рекомендуемый стандарт)
+
+Если в вашем проекте уже есть Netty (или вы можете подключить модуль netty-common), используйте io.netty.util.Recycler. Это шедевр инженерной мысли, созданный специально для этой задачи.
+Как он работает:
+• Каждый поток имеет свой локальный стек объектов (через InternalThreadLocalMap).
+• Если Thread-A берет объект из пула и сам же его возвращает, операция происходит мгновенно и без локов (Zero-Lock Local Allocation).
+• Если Thread-B (бизнес-поток) возвращает объект, который изначально был создан в Thread-A (транспортном потоке), Netty не сует его в локальный стек потока Thread-A напрямую. Вместо этого он кладет его в специальную lock-free очередь «отложенной утилизации» (WeakOrderQueue), привязанную к этому потоку. Поток Thread-A заберет эти объекты позже, когда у него закончатся свои.
+
+Реализация на Netty Recycler:
+
+java
+import io.netty.util.Recycler;
+
+public final class PooledRpcTask implements Runnable {
+    
+    // 1. Создаем статический ресайклер для нашего типа задач
+    private static final Recycler<PooledRpcTask> RECYCLER = new Recycler<>() {
+        @Override
+        protected PooledRpcTask newObject(Handle<PooledRpcTask> handle) {
+            return new PooledRpcTask(handle);
+        }
+    };
+
+    private final Recycler.Handle<PooledRpcTask> handle;
+    
+    // Мутабельное состояние задачи
+    private Object payload;
+    private String channelId;
+
+    private PooledRpcTask(Recycler.Handle<PooledRpcTask> handle) {
+        this.handle = handle;
+    }
+
+    // 2. Фабричный метод получения объекта из пула (вызывается в любом потоке)
+    public static PooledRpcTask get(Object payload, String channelId) {
+        PooledRpcTask task = RECYCLER.get(); // Лок-фри получение
+        task.payload = payload;
+        task.channelId = channelId;
+        return task;
+    }
+
+    @Override
+    public void run() {
+        try {
+            // Бизнес-логика или отправка в Caplin
+        } finally {
+            // 3. Очищаем состояние и возвращаем в пул
+            this.payload = null;
+            this.channelId = null;
+            this.handle.recycle(this); // Лок-фри возврат (даже из другого потока!)
+        }
+    }
+}
+Используйте код с осторожностью.
+
+Паттерн 2. Сегментированный Lock-Free пул (Striped / Partitioned Object Pool)
+
+Если вы пишете решение полностью вручную без внешних зависимостей, вам нужно разбить одну большую точку конкуренции на несколько маленьких. Этот паттерн похож на устройство ConcurrentHashMap до Java 8.
+Создается массив из N независимых неблокирующих под-пулов (страйпов). Количество страйпов обычно выбирается как ближайшая степень двойки к количеству ядер процессора (например, 16 или 32). Когда потоку нужен объект, он выбирает под-пул по хэшу своего ID (Thread.currentThread().getId()).
+
+Реализация сегментированного пула на Java:
+
+java
+import java.util.Queue;
+import org.jctools.queues.MpmcArrayQueue; // Идеально, или ConcurrentLinkedQueue в крайнем случае
+
+public final class StripedRpcTaskPool {
+    
+    private final int mask;
+    private final Queue<PooledRpcTask>[] stripes;
+
+    @SuppressWarnings("unchecked")
+    public StripedRpcTaskPool(int stripeCount, int capacityPerStripe) {
+        // stripeCount должен быть степенью двойки (например, 16, 32)
+        this.mask = stripeCount - 1;
+        this.stripes = new Queue[stripeCount];
+        
+        for (int i = 0; i < stripeCount; i++) {
+            // Используем MPMC (Multi-Producer Multi-Consumer) Lock-Free очередь на массиве из JCTools
+            this.stripes[i] = new MpmcArrayQueue<>(capacityPerStripe);
+        }
+    }
+
+    public PooledRpcTask borrowTask() {
+        int stripeIndex = (int) (Thread.currentThread().getId() & mask);
+        Queue<PooledRpcTask> queue = stripes[stripeIndex];
+        
+        PooledRpcTask task = queue.poll();
+        if (task == null) {
+            // Если пул в этом сегменте пуст, создаем новый объект (Lazy allocation)
+            task = new PooledRpcTask(this, stripeIndex);
+        }
+        return task;
+    }
+
+    public void returnTask(PooledRpcTask task) {
+        // Возвращаем строго в тот же сегмент, где объект родился, чтобы не нарушать баланс размеров
+        Queue<PooledRpcTask> queue = stripes[task.getStripeOwner()];
+        
+        // Если очередь заполнена, просто отдаем объект GC (защита от переполнения)
+        queue.offer(task); 
+    }
+}
+Используйте код с осторожностью.
+
+Паттерн 3. Перенос аллокации ответов на RingBuffer (Disruptor)
+
+Если ваши бизнес-потоки генерируют колоссальный объем ответов (например, миллионы котировок в секунду), то даже самый быстрый пул объектов начнет создавать накладные расходы на вызовы borrow/return.
+В этом случае архитектуру отправки кардинально меняют через LMAX Disruptor:
+1. Создается один глобальный (или на группу клиентов) RingBuffer. Это массив фиксированного размера, который инициализируется объектами RpcTask один раз при старте приложения. Эти объекты никогда не удаляются и не перемещаются в памяти.
+2. Когда бизнес-потоку нужно отправить сообщение, он не берет объект из пула. Он делает CAS-запрос на получение следующего свободного индекса (sequence) в RingBuffer, берет этот объект по ссылке прямо из массива, перезаписывает его мутабельные поля новыми данными и публикует.
+3. Поток SerializingExecutor (потребитель) считывает данные из этого же RingBuffer по кругу.
+При такой схеме аллокация и возврат объектов отсутствуют как явление — данные просто перезаписывают существующие ячейки памяти по кругу.
+
+Резюме: что выбрать?
+
+• Если в проекте разрешен Netty — берите Recycler. Это промышленный стандарт, проверенный годами в самых нагруженных сетевых приложениях.
+• Если нужно чистое Java-решение с минимальной сложностью — сделайте сегментированный пул на базе MpmcArrayQueue из JCTools.
+• Если вы строите Ultra Low-Latency систему распределения маркет-даты — используйте RingBuffer (Disruptor).
+Какой вариант вам ближе по архитектуре — интеграция Netty Recycler, написание сегментированного пула или вы хотите рассмотреть концепцию RingBuffer для отправки исходящих сообщений? Понимание этого поможет выбрать конкретный путь оптимизации.
